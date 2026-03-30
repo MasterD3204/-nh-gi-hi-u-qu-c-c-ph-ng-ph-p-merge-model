@@ -262,6 +262,9 @@ class AceReasonAdapter(BaseDatasetAdapter):
         local_path = find_first_existing_path(spec.local_paths)
         if local_path is not None:
             if local_path.is_dir():
+                split_dir = local_path / spec.split
+                if split_dir.exists() and split_dir.is_dir():
+                    return self._load_saved_dataset(split_dir, split=spec.split, limit=limit)
                 return self._try_load_directory_source(local_path, split=spec.split, limit=limit)
             return self._load_tabular_dataset_file(local_path, split=spec.split, limit=limit)
         if spec.hf_dataset_id:
