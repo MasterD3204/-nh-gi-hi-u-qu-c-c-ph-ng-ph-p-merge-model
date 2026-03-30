@@ -147,6 +147,32 @@ class BaseDatasetAdapter(ABC):
             "num_loaded_records": len(records),
         }
 
+    def _load_tabular_dataset_file(
+        self,
+        path: Path,
+        split: str,
+        limit: int | None = None,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        suffix = path.suffix.lower()
+        if suffix == ".json":
+            return self._load_json_dataset_file(path, split=split, limit=limit)
+        if suffix == ".jsonl":
+            dataset = load_dataset("json", data_files={split: str(path)}, split=split)
+        elif suffix == ".parquet":
+            dataset = load_dataset("parquet", data_files={split: str(path)}, split=split)
+        elif suffix == ".csv":
+            dataset = load_dataset("csv", data_files={split: str(path)}, split=split)
+        else:
+            raise ValueError(f"Unsupported dataset file format: {path}")
+        records = self._dataset_to_records(dataset, limit=limit)
+        return records, {
+            "source_kind": "local_file_dataset",
+            "resolved_path": str(path),
+            "split": split,
+            "dataset_fingerprint": getattr(dataset, "_fingerprint", None),
+            "num_loaded_records": len(records),
+        }
+
     def _load_json_dataset_file(
         self,
         path: Path,
@@ -163,6 +189,70 @@ class BaseDatasetAdapter(ABC):
             "num_loaded_records": len(records),
         }
 
+    def _try_load_directory_source(
+        self,
+        path: Path,
+        split: str,
+        limit: int | None = None,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        try:
+            return self._load_saved_dataset(path, split=split, limit=limit)
+        except Exception:
+            pass
+
+        split_dir = path / split
+        if split_dir.exists() and split_dir.is_dir():
+            try:
+                return self._load_saved_dataset(split_dir, split=split, limit=limit)
+            except Exception:
+                pass
+
+        candidate_patterns = [
+            f"{split}.json",
+            f"{split}.jsonl",
+            f"{split}.parquet",
+            f"{split}.csv",
+            "*.json",
+            "*.jsonl",
+            "*.parquet",
+            "*.csv",
+        ]
+        for pattern in candidate_patterns:
+            matches = sorted(path.rglob(pattern))
+            if not matches:
+                continue
+
+            split_matches = [
+                candidate
+                for candidate in matches
+                if split.lower() in candidate.stem.lower() or candidate.parent.name.lower() == split.lower()
+            ]
+            selected = split_matches or matches
+            try:
+                if len(selected) == 1:
+                    return self._load_tabular_dataset_file(selected[0], split=split, limit=limit)
+
+                dataset_format = selected[0].suffix.lower().lstrip(".")
+                if dataset_format == "jsonl":
+                    dataset_format = "json"
+                data_files = {split: [str(candidate) for candidate in selected]}
+                dataset = load_dataset(dataset_format, data_files=data_files, split=split)
+                records = self._dataset_to_records(dataset, limit=limit)
+                return records, {
+                    "source_kind": "local_file_dataset_multi",
+                    "resolved_path": str(path),
+                    "matched_files": [str(candidate) for candidate in selected],
+                    "split": split,
+                    "dataset_fingerprint": getattr(dataset, "_fingerprint", None),
+                    "num_loaded_records": len(records),
+                }
+            except Exception:
+                continue
+
+        raise FileNotFoundError(
+            f"Directory {path} khong phai Dataset/DatasetDict va cung khong tim thay file du lieu hop le cho split '{split}'."
+        )
+
 
 class AceReasonAdapter(BaseDatasetAdapter):
     name = "ace_reason"
@@ -171,7 +261,9 @@ class AceReasonAdapter(BaseDatasetAdapter):
     def load_records(self, spec: DatasetSpec, limit: int | None = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         local_path = find_first_existing_path(spec.local_paths)
         if local_path is not None:
-            return self._load_saved_dataset(local_path, split=spec.split, limit=limit)
+            if local_path.is_dir():
+                return self._try_load_directory_source(local_path, split=spec.split, limit=limit)
+            return self._load_tabular_dataset_file(local_path, split=spec.split, limit=limit)
         if spec.hf_dataset_id:
             return self._load_hf_dataset(spec, limit=limit)
         raise FileNotFoundError(f"Khong tim thay dataset cho {spec.name}")
@@ -219,20 +311,8 @@ class GSM8KAdapter(BaseDatasetAdapter):
         local_path = find_first_existing_path(spec.local_paths)
         if local_path is not None:
             if local_path.is_dir():
-                try:
-                    return self._load_saved_dataset(local_path, split=spec.split, limit=limit)
-                except Exception:
-                    candidate_files = [
-                        local_path / f"{spec.split}.json",
-                        local_path / f"{spec.split}.jsonl",
-                        local_path / "test.json",
-                        local_path / "test.jsonl",
-                    ]
-                    for candidate in candidate_files:
-                        if candidate.exists():
-                            return self._load_json_dataset_file(candidate, split=spec.split, limit=limit)
-            if local_path.suffix.lower() in {".json", ".jsonl"}:
-                return self._load_json_dataset_file(local_path, split=spec.split, limit=limit)
+                return self._try_load_directory_source(local_path, split=spec.split, limit=limit)
+            return self._load_tabular_dataset_file(local_path, split=spec.split, limit=limit)
         if spec.hf_dataset_id:
             return self._load_hf_dataset(spec, limit=limit)
         raise FileNotFoundError(f"Khong tim thay dataset cho {spec.name}")
@@ -280,8 +360,10 @@ class MathQAAdapter(BaseDatasetAdapter):
         local_path = find_first_existing_path(spec.local_paths)
         if local_path is not None:
             if local_path.is_file():
-                return self._load_json_file(local_path, limit=limit)
-            return self._load_saved_dataset(local_path, split=spec.split, limit=limit)
+                if local_path.suffix.lower() == ".json":
+                    return self._load_json_file(local_path, limit=limit)
+                return self._load_tabular_dataset_file(local_path, split=spec.split, limit=limit)
+            return self._try_load_directory_source(local_path, split=spec.split, limit=limit)
         if spec.hf_dataset_id:
             return self._load_hf_dataset(spec, limit=limit)
         raise FileNotFoundError(f"Khong tim thay dataset cho {spec.name}")
