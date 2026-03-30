@@ -272,8 +272,8 @@ class AceReasonAdapter(BaseDatasetAdapter):
         raise FileNotFoundError(f"Khong tim thay dataset cho {spec.name}")
 
     def prepare_sample(self, record: dict[str, Any], index: int) -> PreparedSample:
-        user_prompt = _extract_user_prompt(record)
-        reference_text = _extract_assistant_text(record)
+        user_prompt = _first_non_empty_value(record, ["input"])
+        reference_text = _first_non_empty_value(record, ["output"])
         reference_answer = extract_final_answer_reasoning(reference_text)
         sample_id = str(record.get("id") or record.get("uuid") or index)
         return PreparedSample(
@@ -285,7 +285,12 @@ class AceReasonAdapter(BaseDatasetAdapter):
             reference_text=reference_text,
             reference_answer=reference_answer,
             raw_sample=json_ready(record),
-            metadata={"prompt_source": "messages_or_heuristic_fields"},
+            metadata={
+                "category": record.get("category"),
+                "source": record.get("source"),
+                "prompt_source": "input",
+                "reference_source": "output",
+            },
         )
 
     def extract_prediction(self, generated_text: str, sample: PreparedSample) -> str:
@@ -314,6 +319,18 @@ class GSM8KAdapter(BaseDatasetAdapter):
         local_path = find_first_existing_path(spec.local_paths)
         if local_path is not None:
             if local_path.is_dir():
+                arrow_matches = sorted(local_path.rglob(f"*{spec.split}*.arrow"))
+                if arrow_matches:
+                    dataset = Dataset.from_file(str(arrow_matches[0]))
+                    records = self._dataset_to_records(dataset, limit=limit)
+                    return records, {
+                        "source_kind": "local_arrow",
+                        "resolved_path": str(arrow_matches[0]),
+                        "matched_files": [str(path) for path in arrow_matches],
+                        "split": spec.split,
+                        "dataset_fingerprint": getattr(dataset, "_fingerprint", None),
+                        "num_loaded_records": len(records),
+                    }
                 return self._try_load_directory_source(local_path, split=spec.split, limit=limit)
             return self._load_tabular_dataset_file(local_path, split=spec.split, limit=limit)
         if spec.hf_dataset_id:
@@ -321,8 +338,8 @@ class GSM8KAdapter(BaseDatasetAdapter):
         raise FileNotFoundError(f"Khong tim thay dataset cho {spec.name}")
 
     def prepare_sample(self, record: dict[str, Any], index: int) -> PreparedSample:
-        question = _first_non_empty_value(record, ["question", "problem", "Problem", "prompt"])
-        answer_text = _first_non_empty_value(record, ["answer", "solution", "output"])
+        question = _first_non_empty_value(record, ["question"])
+        answer_text = _first_non_empty_value(record, ["answer"])
         reference_answer = extract_gsm8k_ground_truth(answer_text)
         sample_id = str(record.get("id") or record.get("idx") or index)
         return PreparedSample(
@@ -372,9 +389,9 @@ class MathQAAdapter(BaseDatasetAdapter):
         raise FileNotFoundError(f"Khong tim thay dataset cho {spec.name}")
 
     def prepare_sample(self, record: dict[str, Any], index: int) -> PreparedSample:
-        problem = _first_non_empty_value(record, ["Problem", "problem", "question"])
-        options = _first_non_empty_value(record, ["options", "Options"])
-        correct_answer = _first_non_empty_value(record, ["correct", "answer"])
+        problem = _first_non_empty_value(record, ["Problem"])
+        options = _first_non_empty_value(record, ["options"])
+        correct_answer = _first_non_empty_value(record, ["correct"])
         options_text = _stringify_options(options)
         user_content = f"{problem}\n\nOptions:\n{options_text}"
         sample_id = str(record.get("id") or record.get("idx") or index)
@@ -390,6 +407,10 @@ class MathQAAdapter(BaseDatasetAdapter):
             metadata={
                 "problem": problem,
                 "options": options_text,
+                "rationale": record.get("Rationale"),
+                "annotated_formula": record.get("annotated_formula"),
+                "linear_formula": record.get("linear_formula"),
+                "category": record.get("category"),
             },
         )
 
@@ -421,57 +442,6 @@ def _first_non_empty_value(record: dict[str, Any], keys: list[str]) -> str:
         if not isinstance(value, str):
             return str(value)
     raise KeyError(f"Khong tim thay key nao trong {keys}")
-
-
-def _extract_user_prompt(record: dict[str, Any]) -> str:
-    for field_name in ["messages", "conversations"]:
-        if field_name in record:
-            messages = record[field_name]
-            user_content = _find_message_content(messages, {"user", "human"})
-            if user_content:
-                return user_content
-
-    instruction = record.get("instruction")
-    input_text = record.get("input")
-    if instruction and input_text:
-        return f"{instruction}\n\n{input_text}"
-    if instruction:
-        return str(instruction)
-
-    return _first_non_empty_value(record, ["prompt", "question", "problem", "Problem", "query"])
-
-
-def _extract_assistant_text(record: dict[str, Any]) -> str:
-    for field_name in ["messages", "conversations"]:
-        if field_name in record:
-            messages = record[field_name]
-            assistant_content = _find_message_content(messages, {"assistant", "gpt"}, reverse=True)
-            if assistant_content:
-                return assistant_content
-
-    return _first_non_empty_value(record, ["output", "response", "answer", "solution"])
-
-
-def _find_message_content(
-    messages: Any,
-    accepted_roles: set[str],
-    reverse: bool = False,
-) -> str | None:
-    if not isinstance(messages, list):
-        return None
-
-    iterable = reversed(messages) if reverse else messages
-    for message in iterable:
-        if not isinstance(message, dict):
-            continue
-        role = str(message.get("role") or message.get("from") or message.get("speaker") or "").lower()
-        if role not in accepted_roles:
-            continue
-        content = message.get("content") or message.get("value") or message.get("text")
-        if content:
-            return str(content)
-    return None
-
 
 def _stringify_options(options: Any) -> str:
     if isinstance(options, str):
